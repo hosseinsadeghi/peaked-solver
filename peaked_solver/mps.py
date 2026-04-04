@@ -52,6 +52,7 @@ import numpy as np
 
 from .types import SolverResult
 from .parser import QuantumCircuit, GATE_LIBRARY
+from .backend import xp, svd, to_numpy, from_numpy, is_jax
 
 # ---------------------------------------------------------------------------
 # Qubit reordering for near-1D topologies (heavy-hex, etc.)
@@ -172,159 +173,93 @@ class MPS:
         self.total_truncation_error: float = 0.0
 
         # |0...0> : each tensor is shape (1, 2, 1)
-        # A^{s=0} = [[1]], A^{s=1} = [[0]]
-        self.tensors: list[np.ndarray] = []
+        self.tensors = []
         for _ in range(n_qubits):
             t = np.zeros((1, 2, 1), dtype=complex)
-            t[0, 0, 0] = 1.0  # |0> component
-            self.tensors.append(t)
+            t[0, 0, 0] = 1.0
+            self.tensors.append(from_numpy(t))
 
     # ---- diagonal gate optimisation (Papers 71, 75) -------------------------
 
     def apply_diagonal_two_adjacent(
-        self, diag_values: np.ndarray, q0: int, q1: int
+        self, diag_values, q0: int, q1: int
     ) -> None:
-        """Apply a diagonal two-qubit gate to adjacent qubits.
-
-        Diagonal gates (CZ, etc.) don't create entanglement between
-        product-state components — they only multiply each amplitude by
-        a phase.  This avoids the costly SVD step entirely.
-
-        Parameters
-        ----------
-        diag_values : ndarray of shape (4,)
-            The diagonal of the 4×4 gate matrix, indexed as
-            |00>, |01>, |10>, |11>.
-        q0, q1 : int
-            Adjacent qubit indices (q1 == q0 + 1).
-        """
+        """Apply a diagonal two-qubit gate to adjacent qubits."""
         assert q1 == q0 + 1
-        A = self.tensors[q0]   # (chi_l, 2, chi_m)
-        B = self.tensors[q1]   # (chi_m, 2, chi_r)
+        A = self.tensors[q0]
+        B = self.tensors[q1]
 
-        # For each combination of physical indices (s0, s1),
-        # multiply the corresponding pair of tensor slices by the phase.
-        # The contraction A[:, s0, :] @ B[:, s1, :] picks up phase diag[2*s0+s1].
-        # We can absorb this into either A or B.  Absorb into A for simplicity:
-        # A'[:, s0, m] = sum_{s1} diag[2*s0+s1] * ... but that's wrong because
-        # we can't separate the s1 dependence.
-        #
-        # Instead: form Theta, apply diagonal, split back.
-        # But diagonal gates don't grow bond dimension!
-        # Theta[a, s0, s1, b] = A[a,s0,m] * B[m,s1,b]
-        # Theta'[a, s0, s1, b] = diag[2*s0+s1] * Theta[a,s0,s1,b]
-        #
-        # We can absorb this as: A'[a,s0,m] = A[a,s0,m], B'[m,s1,b] = B[m,s1,b]
-        # but multiply each (s0,s1) block. Since the diagonal is separable for CZ
-        # (diag = [1,1,1,-1]) we can split: phase_s0_s1 = f(s0)*g(s1) for some f,g?
-        # CZ: [1,1,1,-1] -> not separable.
-        #
-        # General approach: contract, apply diagonal, SVD split.
-        # Since the gate is diagonal, the result has the same bond dimension
-        # (diagonal gates cannot increase Schmidt rank).
-        theta = np.tensordot(A, B, axes=([2], [0]))  # (chi_l, 2, 2, chi_r)
-        for s0 in range(2):
-            for s1 in range(2):
-                theta[:, s0, s1, :] *= diag_values[2 * s0 + s1]
+        theta = xp.tensordot(A, B, axes=([2], [0]))  # (chi_l, 2, 2, chi_r)
 
-        # Split back — bond dimension is unchanged so no truncation needed
+        # Apply diagonal phases — JAX-compatible (no in-place mutation)
+        diag_2d = from_numpy(np.array(diag_values, dtype=complex).reshape(2, 2))
+        theta = theta * diag_2d[xp.newaxis, :, :, xp.newaxis]
+
         chi_l, _, _, chi_r = theta.shape
-        chi_m = A.shape[2]  # original bond dimension
+        chi_m = A.shape[2]
         mat = theta.reshape(chi_l * 2, 2 * chi_r)
-        U, S, Vh = np.linalg.svd(mat, full_matrices=False)
-        chi_new = min(self.chi_max, len(S), chi_m + 1)  # won't exceed original + 1
+        U, S, Vh = svd(mat, full_matrices=False)
+        chi_new = min(self.chi_max, len(S), chi_m + 1)
         if len(S) > chi_new:
-            self.total_truncation_error += float(np.sum(S[chi_new:] ** 2))
+            self.total_truncation_error += float(to_numpy(xp.sum(S[chi_new:] ** 2)))
         U = U[:, :chi_new]
         S = S[:chi_new]
         Vh = Vh[:chi_new, :]
-        self.tensors[q0] = (U * S[np.newaxis, :]).reshape(chi_l, 2, chi_new)
+        self.tensors[q0] = (U * S[xp.newaxis, :]).reshape(chi_l, 2, chi_new)
         self.tensors[q1] = Vh.reshape(chi_new, 2, chi_r)
 
     @staticmethod
-    def is_diagonal_gate(gate_matrix: np.ndarray, tol: float = 1e-10) -> bool:
+    def is_diagonal_gate(gate_matrix, tol: float = 1e-10) -> bool:
         """Check if a gate matrix is diagonal."""
-        return np.allclose(gate_matrix - np.diag(np.diag(gate_matrix)), 0, atol=tol)
+        m = to_numpy(gate_matrix)
+        return np.allclose(m - np.diag(np.diag(m)), 0, atol=tol)
 
     # ---- single-qubit gate ------------------------------------------------
 
-    def apply_single(self, gate_matrix: np.ndarray, qubit: int) -> None:
-        """Apply a 2x2 unitary to qubit *qubit*.
-
-        Contracts the gate with the physical index of A_i:
-            A_i^{s'} = sum_s  gate[s', s] * A_i^{s}
-
-        This does not change bond dimensions.
-        """
-        # gate_matrix shape: (2, 2)
-        # tensor shape: (chi_l, 2, chi_r)
-        # Einstein notation: new[a, s', b] = gate[s', s] * old[a, s, b]
-        self.tensors[qubit] = np.einsum(
-            "ij, ajb -> aib", gate_matrix, self.tensors[qubit]
+    def apply_single(self, gate_matrix, qubit: int) -> None:
+        """Apply a 2x2 unitary to qubit *qubit*."""
+        g = from_numpy(np.asarray(gate_matrix, dtype=complex))
+        self.tensors[qubit] = xp.einsum(
+            "ij, ajb -> aib", g, self.tensors[qubit]
         )
 
     # ---- two-qubit gate on adjacent qubits --------------------------------
 
     def apply_two_adjacent(
-        self, gate_matrix: np.ndarray, q0: int, q1: int
+        self, gate_matrix, q0: int, q1: int
     ) -> None:
-        """Apply a 4x4 gate to adjacent qubits q0, q1 (q1 = q0+1).
-
-        Steps:
-        1. Form Theta = contract A_{q0} and A_{q1} over the shared bond.
-           Theta has shape (chi_left, 2, 2, chi_right).
-        2. Reshape gate (4,4) to (2,2,2,2) and contract with Theta's
-           physical indices.
-        3. SVD split Theta back into two tensors, truncating to chi_max.
-
-        The truncation error (Frobenius norm squared of discarded
-        singular values) is accumulated in ``self.total_truncation_error``.
-        """
+        """Apply a 4x4 gate to adjacent qubits q0, q1 (q1 = q0+1)."""
         assert q1 == q0 + 1, "Qubits must be adjacent for this method"
 
-        A = self.tensors[q0]  # (chi_l, 2, chi_m)
-        B = self.tensors[q1]  # (chi_m, 2, chi_r)
+        A = self.tensors[q0]
+        B = self.tensors[q1]
+        g = from_numpy(np.asarray(gate_matrix, dtype=complex))
 
-        # Step 1: contract into Theta(chi_l, s0, s1, chi_r)
-        # Theta[a, s0, s1, b] = sum_m A[a, s0, m] * B[m, s1, b]
-        theta = np.tensordot(A, B, axes=([2], [0]))
-        # theta shape: (chi_l, 2, 2, chi_r)
+        theta = xp.tensordot(A, B, axes=([2], [0]))
 
-        # Step 2: apply gate
-        # gate_matrix (4,4) -> (2,2,2,2): gate[s0',s1',s0,s1]
-        gate_4d = gate_matrix.reshape(2, 2, 2, 2)
-        # new_theta[a, s0', s1', b] = gate[s0',s1',s0,s1] * theta[a,s0,s1,b]
-        theta = np.einsum("ijkl, aklb -> aijb", gate_4d, theta)
+        gate_4d = g.reshape(2, 2, 2, 2)
+        theta = xp.einsum("ijkl, aklb -> aijb", gate_4d, theta)
 
-        # Step 3: SVD split
-        # Reshape theta (chi_l, 2, 2, chi_r) -> (chi_l*2, 2*chi_r)
         chi_l = theta.shape[0]
         chi_r = theta.shape[3]
         theta_mat = theta.reshape(chi_l * 2, 2 * chi_r)
 
-        U, S, Vh = np.linalg.svd(theta_mat, full_matrices=False)
+        U, S, Vh = svd(theta_mat, full_matrices=False)
 
-        # Truncate to chi_max
-        # The truncation error is sum of discarded singular values squared
-        # (Eckart-Young theorem: ||M - M_k||_F^2 = sum_{i>k} sigma_i^2)
         chi_new = min(self.chi_max, len(S))
         if len(S) > chi_new:
-            self.total_truncation_error += float(np.sum(S[chi_new:] ** 2))
+            self.total_truncation_error += float(to_numpy(xp.sum(S[chi_new:] ** 2)))
         S = S[:chi_new]
         U = U[:, :chi_new]
         Vh = Vh[:chi_new, :]
 
-        # Absorb singular values into U (left-canonical form for this bond)
-        # new A_{q0}[a, s0, m'] = (U @ diag(S))[a*2+s0, m']
-        US = U * S[np.newaxis, :]  # broadcast multiply columns by S
+        US = U * S[xp.newaxis, :]
         self.tensors[q0] = US.reshape(chi_l, 2, chi_new)
-
-        # new A_{q1}[m', s1, b] = Vh[m', s1*chi_r + b]
         self.tensors[q1] = Vh.reshape(chi_new, 2, chi_r)
 
     # ---- two-qubit gate on non-adjacent qubits ----------------------------
 
-    def apply_two(self, gate_matrix: np.ndarray, q0: int, q1: int) -> None:
+    def apply_two(self, gate_matrix, q0: int, q1: int) -> None:
         """Apply a 4x4 gate to potentially non-adjacent qubits.
 
         If the qubits are not adjacent, we SWAP qubit q0 towards q1
@@ -338,16 +273,14 @@ class MPS:
         """
         if abs(q0 - q1) == 1:
             lo, hi = min(q0, q1), max(q0, q1)
+            gm = to_numpy(gate_matrix)
             if q0 < q1:
-                # Diagonal fast-path
-                if self.is_diagonal_gate(gate_matrix):
-                    self.apply_diagonal_two_adjacent(np.diag(gate_matrix), lo, hi)
+                if self.is_diagonal_gate(gm):
+                    self.apply_diagonal_two_adjacent(np.diag(gm), lo, hi)
                 else:
                     self.apply_two_adjacent(gate_matrix, lo, hi)
             else:
-                # Gate acts as (q0=hi, q1=lo) -- need to reorder
-                # Swap physical indices: gate'[s1,s0,s1',s0'] = gate[s0,s1,s0',s1']
-                g4 = gate_matrix.reshape(2, 2, 2, 2)
+                g4 = gm.reshape(2, 2, 2, 2)
                 g4_swapped = g4.transpose(1, 0, 3, 2).reshape(4, 4)
                 self.apply_two_adjacent(g4_swapped, lo, hi)
             return
@@ -382,58 +315,39 @@ class MPS:
     # ---- amplitude extraction ---------------------------------------------
 
     def get_amplitude(self, bitstring: str) -> complex:
-        """Compute <bitstring|psi> by contracting the MPS chain.
-
-        For a bitstring s1 s2 ... sn, the amplitude is:
-            A1^{s1} @ A2^{s2} @ ... @ An^{sn}
-        which is a product of matrices resulting in a (1,1) scalar.
-        """
-        result = self.tensors[0][:, int(bitstring[0]), :]  # (chi_l=1, chi_r)
+        """Compute <bitstring|psi> by contracting the MPS chain."""
+        result = self.tensors[0][:, int(bitstring[0]), :]
         for i in range(1, self.n):
             bit = int(bitstring[i])
-            mat = self.tensors[i][:, bit, :]  # (chi_m, chi_r)
+            mat = self.tensors[i][:, bit, :]
             result = result @ mat
-        return complex(result[0, 0])
+        return complex(to_numpy(result)[0, 0])
 
     def get_probabilities(self, bitstrings: list[str]) -> list[float]:
         """Compute |<bitstring|psi>|^2 for a list of candidate bitstrings."""
         return [abs(self.get_amplitude(bs)) ** 2 for bs in bitstrings]
 
     def get_top_k_bitstrings(self, k: int) -> list[tuple[str, float]]:
-        """Find the k most probable bitstrings via greedy MPS sampling.
-
-        We use a layer-by-layer greedy/beam approach:
-        For each qubit from left to right, we compute the conditional
-        probabilities of |0> and |1> given the bits chosen so far,
-        and keep the top-k partial bitstrings.
-
-        This is not guaranteed to find the global optimum but works
-        well for peaked distributions.
-        """
-        # Beam of (partial_bitstring, accumulated_vector)
-        # accumulated_vector starts as shape (1,) identity
-        beam: list[tuple[str, np.ndarray]] = [("", np.ones((1,), dtype=complex))]
+        """Find the k most probable bitstrings via greedy MPS sampling."""
+        beam = [("", from_numpy(np.ones((1,), dtype=complex)))]
 
         for i in range(self.n):
-            candidates: list[tuple[str, np.ndarray, float]] = []
+            candidates = []
             for prefix, vec in beam:
                 for bit in [0, 1]:
-                    # Contract with A_i^{bit}: vec @ A_i[:, bit, :]
-                    mat = self.tensors[i][:, bit, :]  # (chi_l, chi_r)
-                    new_vec = vec @ mat  # (chi_r,)
+                    mat = self.tensors[i][:, bit, :]
+                    new_vec = vec @ mat
 
-                    # Estimate probability magnitude for ranking
-                    prob_est = float(np.sum(np.abs(new_vec) ** 2))
+                    prob_est = float(to_numpy(xp.sum(xp.abs(new_vec) ** 2)))
                     candidates.append((prefix + str(bit), new_vec, prob_est))
 
-            # Keep top 2*k candidates by probability estimate
             candidates.sort(key=lambda x: x[2], reverse=True)
             beam = [(bs, vec) for bs, vec, _ in candidates[: max(2 * k, 20)]]
 
-        # Final: compute exact amplitudes for surviving bitstrings
-        results: list[tuple[str, float]] = []
+        results = []
         for bs, vec in beam:
-            amp = complex(vec[0]) if vec.shape[0] == 1 else complex(np.sum(vec))
+            v = to_numpy(vec)
+            amp = complex(v[0]) if v.shape[0] == 1 else complex(np.sum(v))
             prob = abs(amp) ** 2
             results.append((bs, prob))
 
@@ -669,65 +583,46 @@ def _apply_three_qubit_gate(mps: MPS, gate) -> None:
     B = mps.tensors[base + 1]  # (chi1, 2, chi2)
     C = mps.tensors[base + 2]  # (chi2, 2, chi_r)
 
-    # theta[chi_l, s0, s1, s2, chi_r]
-    AB = np.tensordot(A, B, axes=([2], [0]))  # (chi_l, 2, 2, chi2)
-    theta = np.tensordot(AB, C, axes=([3], [0]))  # (chi_l, 2, 2, 2, chi_r)
+    AB = xp.tensordot(A, B, axes=([2], [0]))
+    theta = xp.tensordot(AB, C, axes=([3], [0]))
 
-    # Build the qubit ordering map for the gate
-    # The gate acts on (q0, q1, q2) but our theta has qubits at (base, base+1, base+2)
-    # We need to figure out which original qubit ended up at each position.
-    # Since we moved them in order (qs[0], qs[1] -> base+1, qs[2] -> base+2),
-    # the mapping depends on the original gate qubit order vs sorted order.
-    # For simplicity, apply the gate matrix directly (assuming sorted order matches).
+    sorted_to_gate = [gate.qubits.index(sq) for sq in qs]
 
-    # Map gate qubits to positions in theta
-    # gate.qubits = (q0, q1, q2), sorted as qs = [qs[0], qs[1], qs[2]]
-    # theta has qubits in sorted order. We need to permute gate matrix accordingly.
-    sorted_to_gate = []
-    for sq in qs:
-        sorted_to_gate.append(gate.qubits.index(sq))
-
-    # Permute the gate matrix rows/cols to match sorted qubit order
-    gate_8x8 = gate.matrix  # (8, 8)
-    gate_tensor = gate_8x8.reshape(2, 2, 2, 2, 2, 2)  # (out0, out1, out2, in0, in1, in2)
-    # Permute: sorted_to_gate[i] gives which gate-qubit is at position i
+    gate_8x8 = from_numpy(np.asarray(gate.matrix, dtype=complex))
+    gate_tensor = gate_8x8.reshape(2, 2, 2, 2, 2, 2)
     perm_in = [3 + sorted_to_gate[j] for j in range(3)]
     perm_out = [sorted_to_gate[j] for j in range(3)]
     gate_tensor = gate_tensor.transpose(perm_out + perm_in)
 
-    # Apply: theta_new[a, s0', s1', s2', b] = gate[s0',s1',s2',s0,s1,s2] * theta[a,s0,s1,s2,b]
     chi_l = theta.shape[0]
     chi_r = theta.shape[4]
     theta_flat = theta.reshape(chi_l, 8, chi_r)
     gate_flat = gate_tensor.reshape(8, 8)
-    theta_new = np.einsum("ij, ajb -> aib", gate_flat, theta_flat)
+    theta_new = xp.einsum("ij, ajb -> aib", gate_flat, theta_flat)
     theta = theta_new.reshape(chi_l, 2, 2, 2, chi_r)
 
-    # Split back via two SVDs
-    # First split: (chi_l * 2) x (2 * 2 * chi_r)
     mat1 = theta.reshape(chi_l * 2, 4 * chi_r)
-    U1, S1, Vh1 = np.linalg.svd(mat1, full_matrices=False)
+    U1, S1, Vh1 = svd(mat1, full_matrices=False)
     chi1_new = min(mps.chi_max, len(S1))
     if len(S1) > chi1_new:
-        mps.total_truncation_error += float(np.sum(S1[chi1_new:] ** 2))
+        mps.total_truncation_error += float(to_numpy(xp.sum(S1[chi1_new:] ** 2)))
     U1 = U1[:, :chi1_new]
     S1 = S1[:chi1_new]
     Vh1 = Vh1[:chi1_new, :]
 
-    mps.tensors[base] = (U1 * S1[np.newaxis, :]).reshape(chi_l, 2, chi1_new)
+    mps.tensors[base] = (U1 * S1[xp.newaxis, :]).reshape(chi_l, 2, chi1_new)
 
-    # Second split: (chi1_new * 2) x (2 * chi_r)
     remainder = Vh1.reshape(chi1_new, 2, 2, chi_r)
     mat2 = remainder.reshape(chi1_new * 2, 2 * chi_r)
-    U2, S2, Vh2 = np.linalg.svd(mat2, full_matrices=False)
+    U2, S2, Vh2 = svd(mat2, full_matrices=False)
     chi2_new = min(mps.chi_max, len(S2))
     if len(S2) > chi2_new:
-        mps.total_truncation_error += float(np.sum(S2[chi2_new:] ** 2))
+        mps.total_truncation_error += float(to_numpy(xp.sum(S2[chi2_new:] ** 2)))
     U2 = U2[:, :chi2_new]
     S2 = S2[:chi2_new]
     Vh2 = Vh2[:chi2_new, :]
 
-    mps.tensors[base + 1] = (U2 * S2[np.newaxis, :]).reshape(chi1_new, 2, chi2_new)
+    mps.tensors[base + 1] = (U2 * S2[xp.newaxis, :]).reshape(chi1_new, 2, chi2_new)
     mps.tensors[base + 2] = Vh2.reshape(chi2_new, 2, chi_r)
 
     # Undo swaps in reverse order
