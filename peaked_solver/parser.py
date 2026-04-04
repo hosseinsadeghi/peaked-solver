@@ -405,6 +405,9 @@ class QuantumCircuit:
         -------
         QuantumCircuit
         """
+        # Strip custom gate definitions: "gate name params { body }"
+        # These contain formal parameters that look like qubit references.
+        qasm_str = re.sub(r"gate\s+\w+[^{]*\{[^}]*\}", "", qasm_str)
         lines = qasm_str.strip().split(";")
         qreg_map: dict[str, tuple[int, int]] = {}  # name -> (start_index, size)
         total_qubits = 0
@@ -412,6 +415,9 @@ class QuantumCircuit:
         # First pass: collect qubit registers
         for raw_line in lines:
             line = raw_line.strip()
+            # Strip leading '}' from custom gate definition bodies
+            if line.startswith("}"):
+                line = line[1:].strip()
             m = re.match(r"qreg\s+(\w+)\s*\[\s*(\d+)\s*\]", line)
             if m:
                 name, size = m.group(1), int(m.group(2))
