@@ -64,13 +64,27 @@ def is_jax() -> bool:
 def svd(matrix, full_matrices: bool = False):
     """SVD that works on both numpy and JAX arrays.
 
+    Falls back to scipy's more robust 'gesvd' driver if numpy's
+    default LAPACK 'gesdd' fails to converge.
+
     Returns (U, S, Vh) — same convention as numpy.
     """
     if _USE_JAX:
         import jax.numpy as jnp
         return jnp.linalg.svd(matrix, full_matrices=full_matrices)
-    else:
+
+    try:
         return np.linalg.svd(matrix, full_matrices=full_matrices)
+    except np.linalg.LinAlgError:
+        # gesdd failed — retry with the slower but more robust gesvd
+        try:
+            from scipy.linalg import svd as scipy_svd
+            return scipy_svd(matrix, full_matrices=full_matrices,
+                             lapack_driver="gesvd")
+        except ImportError:
+            # No scipy — clamp tiny values and retry
+            matrix = np.where(np.abs(matrix) < 1e-15, 0.0, matrix)
+            return np.linalg.svd(matrix, full_matrices=full_matrices)
 
 
 def to_numpy(arr) -> np.ndarray:
