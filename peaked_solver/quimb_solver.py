@@ -209,20 +209,19 @@ def _solve_cotengra(
     print(f"  [cotengra] Finding contraction tree (opt_time={opt_time}s)...")
     t_opt = time.perf_counter()
 
-    # Build the TN for a reference bitstring to get the structure.
-    # Use output_inds=() to handle hyper tensor networks (indices appearing 3+ times).
-    ref_bs = "0" * n
-    tn_ref = circ.amplitude_tn(ref_bs)
-
+    # Use Circuit.amplitude() which handles hyper-indices internally.
+    # First, do a rehearsal run to find and cache the optimal contraction tree.
     opt = ctg.HyperOptimizer(
         methods=["greedy", "kahypar"],
         max_time=opt_time,
         progbar=True,
     )
-    tree = tn_ref.contraction_tree(optimize=opt, output_inds=())
 
-    tw = tree.contraction_width()
-    cost = tree.contraction_cost()
+    ref_bs = "0" * n
+    info = circ.amplitude(ref_bs, optimize=opt, rehearse=True)
+
+    tw = info["W"]
+    cost = info["C"]
     print(f"  [cotengra] Tree found in {time.perf_counter() - t_opt:.1f}s")
     print(f"  [cotengra] Contraction width: {tw:.1f}, log10(cost): {np.log10(float(cost)):.1f}")
 
@@ -258,16 +257,15 @@ def _solve_cotengra(
     t_eval = time.perf_counter()
 
     for i, bs in enumerate(candidates):
-        tn_bs = circ.amplitude_tn(bs)
-        amp = tn_bs.contract(optimize=tree, output_inds=())
+        amp = circ.amplitude(bs, optimize=opt)
         prob = abs(complex(amp)) ** 2
         results.append((bs, prob))
 
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 10 == 0 or i == 0:
             elapsed = time.perf_counter() - t_eval
             rate = (i + 1) / elapsed
             best_so_far = max(results, key=lambda x: x[1])
-            print(f"  [cotengra] {i+1}/{len(candidates)} ({rate:.0f}/s) "
+            print(f"  [cotengra] {i+1}/{len(candidates)} ({rate:.1f}/s) "
                   f"best prob so far: {best_so_far[1]:.6e}")
 
     # Sort and return top-k
