@@ -221,9 +221,10 @@ def _solve_cotengra(
     info = circ.amplitude(ref_bs, optimize=opt, rehearse=True)
 
     tw = info["W"]
-    cost = info["C"]
+    log2_cost = info["C"]  # C is already log2(FLOPS)
     print(f"  [cotengra] Tree found in {time.perf_counter() - t_opt:.1f}s")
-    print(f"  [cotengra] Contraction width: {tw:.1f}, log10(cost): {np.log10(float(cost)):.1f}")
+    print(f"  [cotengra] Contraction width: {tw:.1f}, log2(FLOPS): {log2_cost:.1f}, "
+          f"log10(FLOPS): {log2_cost * np.log10(2):.1f}")
 
     # --- Step 2: Generate candidate bitstrings ---
     candidates = set()
@@ -280,7 +281,7 @@ def _solve_cotengra(
         heuristic_used="quimb_cotengra",
         circuit_analysis={
             "contraction_width": float(tw),
-            "log10_cost": float(np.log10(float(cost))),
+            "log2_flops": float(log2_cost),
             "opt_time_s": round(time.perf_counter() - t_opt, 1),
             "candidates_evaluated": len(candidates),
             "eval_time_ms": round(eval_ms, 0),
