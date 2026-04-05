@@ -39,14 +39,20 @@ def main():
 
     # quimb-specific options
     quimb_group = parser.add_argument_group("quimb solver options")
-    quimb_group.add_argument("--quimb-mode", choices=["mps", "tn"], default="mps",
-                             help="quimb backend: mps (CircuitMPS) or tn (general TN contraction). Default: mps")
+    quimb_group.add_argument("--quimb-mode", choices=["mps", "tn", "cotengra"], default="mps",
+                             help="quimb backend: mps (CircuitMPS), tn (general TN), cotengra (optimised contraction tree). Default: mps")
     quimb_group.add_argument("--max-bond", type=int, default=64,
                              help="Max bond dimension for quimb (default: 64)")
     quimb_group.add_argument("--samples", type=int, default=10000,
-                             help="Number of bitstring samples for quimb (default: 10000)")
+                             help="Number of bitstring samples for quimb mps/tn (default: 10000)")
     quimb_group.add_argument("--contractor", type=str, default="greedy",
                              help="TN contraction backend for quimb tn mode: greedy, auto, cotengra (default: greedy)")
+    quimb_group.add_argument("--opt-time", type=float, default=60.0,
+                             help="Cotengra hyper-optimizer time budget in seconds (default: 60)")
+    quimb_group.add_argument("--n-candidates", type=int, default=2000,
+                             help="Number of candidate bitstrings for cotengra mode (default: 2000)")
+    quimb_group.add_argument("--seeds", type=str, default=None,
+                             help="Comma-separated seed bitstrings for cotengra mode")
 
     args = parser.parse_args()
 
@@ -87,6 +93,9 @@ def main():
         if quimb_solve is None:
             print("Error: quimb is not installed. Run: pip install quimb", file=sys.stderr)
             sys.exit(1)
+        seed_bitstrings = None
+        if args.seeds:
+            seed_bitstrings = [s.strip() for s in args.seeds.split(",")]
         result = quimb_solve(
             circuit,
             top_k=args.top_k,
@@ -95,6 +104,9 @@ def main():
             heavy_hex=args.heavy_hex,
             samples=args.samples,
             contractor=args.contractor,
+            opt_time=args.opt_time,
+            n_candidates=args.n_candidates,
+            seed_bitstrings=seed_bitstrings,
         )
     wall_time = time.time() - t0
 
