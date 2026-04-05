@@ -209,7 +209,8 @@ def _solve_cotengra(
     print(f"  [cotengra] Finding contraction tree (opt_time={opt_time}s)...")
     t_opt = time.perf_counter()
 
-    # Build the TN for a reference bitstring to get the structure
+    # Build the TN for a reference bitstring to get the structure.
+    # Use output_inds=() to handle hyper tensor networks (indices appearing 3+ times).
     ref_bs = "0" * n
     tn_ref = circ.amplitude_tn(ref_bs)
 
@@ -218,7 +219,7 @@ def _solve_cotengra(
         max_time=opt_time,
         progbar=True,
     )
-    tree = tn_ref.contraction_tree(optimize=opt)
+    tree = tn_ref.contraction_tree(optimize=opt, output_inds=())
 
     tw = tree.contraction_width()
     cost = tree.contraction_cost()
@@ -258,7 +259,7 @@ def _solve_cotengra(
 
     for i, bs in enumerate(candidates):
         tn_bs = circ.amplitude_tn(bs)
-        amp = tn_bs.contract(optimize=tree)
+        amp = tn_bs.contract(optimize=tree, output_inds=())
         prob = abs(complex(amp)) ** 2
         results.append((bs, prob))
 
