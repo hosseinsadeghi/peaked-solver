@@ -6,6 +6,8 @@ Usage:
     python solve.py circuits/P3_sharp_peak.qasm --solver mps --top-k 20 --chi-max 128
     python solve.py circuits/P7_heavy_hex_1275.qasm --solver mps --heavy-hex
     python solve.py circuits/P2_swift_rise.qasm --solver 2d --timeout 120
+    python solve.py circuits/P1_little_peak.qasm --solver quimb --quimb-mode mps --max-bond 64
+    python solve.py circuits/P1_little_peak.qasm --solver quimb --quimb-mode tn --contractor greedy
 """
 
 import argparse
@@ -21,8 +23,9 @@ def main():
         description="Solve a peaked circuit and show bitstring distribution",
     )
     parser.add_argument("qasm", type=Path, help="Path to .qasm file")
-    parser.add_argument("--solver", choices=["mps", "2d"], default="mps",
-                        help="Solver: mps (Matrix Product State) or 2d (general tensor network). Default: mps")
+    parser.add_argument("--solver", choices=["mps", "2d", "quimb"], default="mps",
+                        help="Solver: mps (local MPS), 2d (local TN contraction), "
+                             "quimb (quimb tensor network). Default: mps")
     parser.add_argument("--top-k", type=int, default=10,
                         help="Number of top bitstrings to show (default: 10)")
     parser.add_argument("--chi-max", type=int, default=None,
@@ -32,7 +35,19 @@ def main():
     parser.add_argument("--candidates", type=int, default=None,
                         help="Number of candidate bitstrings (2d solver only)")
     parser.add_argument("--heavy-hex", action="store_true",
-                        help="Heavy-hex topology mode: Cuthill-McKee qubit reordering + 1.5x chi bump (mps solver only)")
+                        help="Heavy-hex topology mode (mps and quimb solvers)")
+
+    # quimb-specific options
+    quimb_group = parser.add_argument_group("quimb solver options")
+    quimb_group.add_argument("--quimb-mode", choices=["mps", "tn"], default="mps",
+                             help="quimb backend: mps (CircuitMPS) or tn (general TN contraction). Default: mps")
+    quimb_group.add_argument("--max-bond", type=int, default=64,
+                             help="Max bond dimension for quimb (default: 64)")
+    quimb_group.add_argument("--samples", type=int, default=10000,
+                             help="Number of bitstring samples for quimb (default: 10000)")
+    quimb_group.add_argument("--contractor", type=str, default="greedy",
+                             help="TN contraction backend for quimb tn mode: greedy, auto, cotengra (default: greedy)")
+
     args = parser.parse_args()
 
     # Resolve file path
@@ -52,7 +67,7 @@ def main():
     print(f"Circuit: {qasm_path.name}")
     print(f"Qubits:  {circuit.n_qubits}")
     print(f"Gates:   {len(circuit.gates)}")
-    print(f"Solver:  {args.solver}")
+    print(f"Solver:  {args.solver}" + (f" ({args.quimb_mode})" if args.solver == "quimb" else ""))
     print()
 
     # Solve
@@ -62,11 +77,25 @@ def main():
         if args.chi_max is not None:
             kwargs["chi_max"] = args.chi_max
         result = mps_solve(circuit, **kwargs)
-    else:
+    elif args.solver == "2d":
         kwargs = {"top_k": args.top_k, "timeout": args.timeout}
         if args.candidates is not None:
             kwargs["n_candidates"] = args.candidates
         result = tn_solve(circuit, **kwargs)
+    elif args.solver == "quimb":
+        from peaked_solver import quimb_solve
+        if quimb_solve is None:
+            print("Error: quimb is not installed. Run: pip install quimb", file=sys.stderr)
+            sys.exit(1)
+        result = quimb_solve(
+            circuit,
+            top_k=args.top_k,
+            mode=args.quimb_mode,
+            max_bond=args.max_bond,
+            heavy_hex=args.heavy_hex,
+            samples=args.samples,
+            contractor=args.contractor,
+        )
     wall_time = time.time() - t0
 
     # Display results
